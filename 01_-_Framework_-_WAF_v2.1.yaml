@@ -1,0 +1,992 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS Well-Architected Framework Assessment - 6 Pilares (v2).
+  Avalia Excelencia Operacional, Seguranca, Confiabilidade,
+  Eficiencia de Performance, Otimizacao de Custos e Sustentabilidade.
+  Usa apenas APIs de leitura. Nenhum recurso da conta e modificado
+  (so grava o relatorio JSON no bucket proprio). Requer CAPABILITY_IAM.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email para receber o resumo (opcional). Confirme a assinatura recebida por email.
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+  RunOnDeploy:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Disparar o assessment (de forma assincrona) logo apos o deploy?
+  AssessmentRegions:
+    Type: String
+    Default: ''
+    AllowedPattern: '^[a-z0-9,-]*$'
+    Description: >-
+      Regioes a avaliar, separadas por virgula e sem espacos (ex. sa-east-1,us-east-1).
+      Vazio = apenas a regiao onde o stack foi criado.
+  ResourcePrefix:
+    Type: String
+    Default: waf-assessment
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_-]{0,39}$'
+    Description: Prefixo do nome da funcao Lambda. Mude se for criar mais de um stack na mesma regiao.
+  DeprecatedLambdaRuntimes:
+    Type: String
+    Default: 'python3.6,python3.7,python3.8,python3.9,python3.10,nodejs10.x,nodejs12.x,nodejs14.x,nodejs16.x,nodejs18.x,nodejs20.x,ruby2.5,ruby2.7,ruby3.2,java8,dotnetcore2.1,dotnetcore3.1,dotnet5.0,dotnet6,dotnet7,go1.x,provided,provided.al2'
+    Description: >-
+      Runtimes Lambda considerados depreciados (separados por virgula). Nao existe API para isso:
+      revise esta lista periodicamente na documentacao oficial de runtimes do Lambda.
+  LowCarbonRegions:
+    Type: String
+    Default: 'eu-north-1,eu-west-3,ca-central-1,sa-east-1,us-west-2'
+    Description: >-
+      Regioes tratadas como de baixa intensidade de carbono no pilar de Sustentabilidade.
+      Lista editavel - confira a ferramenta Customer Carbon Footprint da AWS.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasRegions: !Not [!Equals [!Ref AssessmentRegions, '']]
+  ShouldRunOnDeploy: !Equals [!Ref RunOnDeploy, 'true']
+
+Resources:
+  # -------------------------------------------------------------------------
+  # S3 Bucket - relatorios JSON (privado, versionado, TLS obrigatorio)
+  # Retain: os relatorios sobrevivem a exclusao do stack
+  # -------------------------------------------------------------------------
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ReportBucket.Arn
+              - !Sub '${ReportBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # -------------------------------------------------------------------------
+  # SNS Topic - resumo por email (opcional)
+  # -------------------------------------------------------------------------
+  AssessmentTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasEmail
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # Log group com retencao (evita logs eternos). O nome e o padrao do Lambda
+  # (/aws/lambda/<funcao>); a funcao tem DependsOn para o stack criar o grupo antes dela.
+  # -------------------------------------------------------------------------
+  AssessmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-${AWS::AccountId}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # IAM Role - somente as acoes de leitura que o codigo realmente usa
+  # -------------------------------------------------------------------------
+  AssessmentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: WafAssessmentReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Pillar1OperationalExcellence
+                Effect: Allow
+                Action:
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetTrailStatus
+                  - config:DescribeConfigurationRecorderStatus
+                  - cloudwatch:DescribeAlarms
+                  - tag:GetTagKeys
+                  - ssm:ListDocuments
+                Resource: '*'
+              - Sid: Pillar2Security
+                Effect: Allow
+                Action:
+                  - iam:GetAccountSummary
+                  - iam:GetAccountPasswordPolicy
+                  - guardduty:ListDetectors
+                  - guardduty:GetDetector
+                  - securityhub:DescribeHub
+                  - s3:GetAccountPublicAccessBlock
+                  - access-analyzer:ListAnalyzers
+                Resource: '*'
+              - Sid: Pillar3Reliability
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - backup:ListBackupPlans
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeAvailabilityZones
+                Resource: '*'
+              - Sid: Pillar4Performance
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
+                  - lambda:ListFunctions
+                  - cloudfront:ListDistributions
+                  - elasticache:DescribeCacheClusters
+                Resource: '*'
+              - Sid: Pillar5Cost
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeAddresses
+                  - savingsplans:DescribeSavingsPlans
+                Resource: '*'
+              - Sid: Pillar6Sustainability
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - s3:GetLifecycleConfiguration
+                  - s3:GetIntelligentTieringConfiguration
+                Resource: '*'
+              - Sid: SaveReport
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ReportBucket.Arn}/assessments/*'
+        - !If
+          - HasEmail
+          - PolicyName: PublishSummary
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: PublishToSNS
+                  Effect: Allow
+                  Action: sns:Publish
+                  Resource: !Ref AssessmentTopic
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # Lambda - Assessment dos 6 Pilares
+  # -------------------------------------------------------------------------
+  WafAssessmentFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AssessmentLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-${AWS::AccountId}'
+      Description: Well-Architected Framework Assessment - 6 Pilares (somente leitura)
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Role: !GetAtt AssessmentRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Ref ReportBucket
+          ACCOUNT_ID: !Ref AWS::AccountId
+          REGIONS: !If [HasRegions, !Ref AssessmentRegions, !Ref 'AWS::Region']
+          SNS_TOPIC_ARN: !If [HasEmail, !Ref AssessmentTopic, '']
+          DEPRECATED_RUNTIMES: !Ref DeprecatedLambdaRuntimes
+          LOW_CARBON_REGIONS: !Ref LowCarbonRegions
+          SELF_FUNCTIONS: !Sub '${ResourcePrefix}-${AWS::AccountId},${ResourcePrefix}-trigger-${AWS::AccountId}'
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+      Code:
+        ZipFile: |
+          import json, os, re, boto3
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+
+          ACCOUNT_ID = os.environ['ACCOUNT_ID']
+          REPORT_BUCKET = os.environ['REPORT_BUCKET']
+          SNS_TOPIC = os.environ.get('SNS_TOPIC_ARN', '').strip()
+
+          def csv_env(name):
+              return [x.strip() for x in os.environ.get(name, '').split(',') if x.strip()]
+
+          REGIONS = csv_env('REGIONS')
+          SELF_NAMES = set(csv_env('SELF_FUNCTIONS'))
+          DEPRECATED_RUNTIMES = set(csv_env('DEPRECATED_RUNTIMES'))
+          LOW_CARBON_REGIONS = set(csv_env('LOW_CARBON_REGIONS'))
+          HOME_REGION = REGIONS[0] if REGIONS else os.environ.get('AWS_REGION', 'us-east-1')
+
+          WEIGHTS = {'CRITICAL': 30, 'HIGH': 20, 'MEDIUM': 10, 'LOW': 5}
+          CRITICAL_CAP = 50
+          PILLARS = ['operational_excellence', 'security', 'reliability',
+                     'performance_efficiency', 'cost_optimization', 'sustainability']
+          PILLAR_NAMES = {
+              'operational_excellence': 'Excelencia Operacional',
+              'security': 'Seguranca',
+              'reliability': 'Confiabilidade',
+              'performance_efficiency': 'Performance',
+              'cost_optimization': 'Custos',
+              'sustainability': 'Sustentabilidade'
+          }
+
+          def api(fn, default=None, expected=()):
+              try:
+                  return fn(), None
+              except ClientError as e:
+                  code = e.response.get('Error', {}).get('Code', 'ClientError')
+                  if code in expected:
+                      return default, None
+                  print(f'WARN: {code}: {e}')
+                  return default, code
+              except Exception as e:
+                  print(f'WARN: {type(e).__name__}: {e}')
+                  return default, type(e).__name__
+
+          def pages(client, op, key, **kw):
+              items = []
+              for page in client.get_paginator(op).paginate(**kw):
+                  items.extend(page.get(key, []))
+              return items
+
+          def add(fs, check, status, detail, severity='MEDIUM', region='global', resources=None):
+              f = {'check': check, 'status': status, 'severity': severity, 'region': region, 'detail': detail}
+              if resources:
+                  f['resources'] = list(resources)[:10]
+              fs.append(f)
+
+          def unknown(fs, check, err, severity='MEDIUM', region='global'):
+              add(fs, check, 'UNKNOWN', f'Nao foi possivel verificar ({err}) - confira as permissoes da role', severity, region)
+
+          def ratio_status(ratio, ok, warn):
+              return 'OK' if ratio >= ok else ('WARN' if ratio >= warn else 'FAIL')
+
+          _cache = {}
+
+          def cached(key, fn):
+              if key not in _cache:
+                  _cache[key] = fn()
+              return _cache[key]
+
+          def running_instances(region):
+              def load():
+                  ec2 = boto3.client('ec2', region_name=region)
+                  return api(lambda: [i for r in pages(ec2, 'describe_instances', 'Reservations',
+                                                       Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+                                      for i in r.get('Instances', [])], [])
+              return cached(('ec2', region), load)
+
+          def instance_types(region):
+              def load():
+                  insts, err = running_instances(region)
+                  if err or not insts:
+                      return {}, err
+                  ec2 = boto3.client('ec2', region_name=region)
+                  types = sorted({i['InstanceType'] for i in insts})
+
+                  def fetch():
+                      info = {}
+                      for n in range(0, len(types), 100):
+                          for t in ec2.describe_instance_types(InstanceTypes=types[n:n+100])['InstanceTypes']:
+                              info[t['InstanceType']] = {
+                                  'current': t.get('CurrentGeneration', False),
+                                  'arm': 'arm64' in t.get('ProcessorInfo', {}).get('SupportedArchitectures', [])
+                              }
+                      return info
+                  return api(fetch, {})
+              return cached(('types', region), load)
+
+          def lambda_functions(region):
+              def load():
+                  lmb = boto3.client('lambda', region_name=region)
+                  funcs, err = api(lambda: pages(lmb, 'list_functions', 'Functions'), [])
+                  return [f for f in funcs if f['FunctionName'] not in SELF_NAMES], err
+              return cached(('lambda', region), load)
+
+          # ---------------- PILAR 1: EXCELENCIA OPERACIONAL ----------------
+          def pillar1(region):
+              fs = []
+              ct = boto3.client('cloudtrail', region_name=region)
+              trails, err = api(lambda: ct.describe_trails().get('trailList', []), [])
+              if err:
+                  unknown(fs, 'CloudTrail', err, 'HIGH', region)
+              else:
+                  active = [t['Name'] for t in trails if api(lambda: ct.get_trail_status(Name=t['TrailARN']).get('IsLogging'), False)[0]]
+                  if active:
+                      add(fs, 'CloudTrail', 'OK', f'{len(active)} trail(s) ativo(s)', 'HIGH', region)
+                  else:
+                      add(fs, 'CloudTrail', 'FAIL', 'Nenhum trail ativo encontrado', 'HIGH', region)
+
+              cfg = boto3.client('config', region_name=region)
+              rec, err = api(lambda: cfg.describe_configuration_recorder_status().get('ConfigurationRecordersStatus', []), [])
+              if err:
+                  unknown(fs, 'AWS Config', err, 'MEDIUM', region)
+              elif any(r.get('recording') for r in rec):
+                  add(fs, 'AWS Config', 'OK', 'Config recorder ativo', 'MEDIUM', region)
+              else:
+                  add(fs, 'AWS Config', 'FAIL', 'Config recorder nao encontrado ou inativo', 'MEDIUM', region)
+
+              cw = boto3.client('cloudwatch', region_name=region)
+              alarms, err = api(lambda: pages(cw, 'describe_alarms', 'MetricAlarms'), [])
+              if err:
+                  unknown(fs, 'CloudWatch Alarms', err, 'MEDIUM', region)
+              elif len(alarms) >= 3:
+                  add(fs, 'CloudWatch Alarms', 'OK', f'{len(alarms)} alarme(s) configurado(s)', 'MEDIUM', region)
+              elif alarms:
+                  add(fs, 'CloudWatch Alarms', 'WARN', f'Apenas {len(alarms)} alarme(s) - recomendado mais', 'MEDIUM', region)
+              else:
+                  add(fs, 'CloudWatch Alarms', 'FAIL', 'Nenhum alarme CloudWatch configurado', 'MEDIUM', region)
+
+              tg = boto3.client('resourcegroupstaggingapi', region_name=region)
+              keys, err = api(lambda: pages(tg, 'get_tag_keys', 'TagKeys'), [])
+              keys = [k for k in keys if not k.startswith('aws:') and k not in ('Project', 'ManagedBy')]  # ignora as tags do proprio stack
+              if err:
+                  unknown(fs, 'Tagging', err, 'LOW', region)
+              elif len(keys) >= 3:
+                  add(fs, 'Tagging', 'OK', f'{len(keys)} chave(s) de tag definidas pelo usuario (cobertura nao verificada)', 'LOW', region)
+              elif keys:
+                  add(fs, 'Tagging', 'WARN', f'Apenas {len(keys)} chave(s) de tag - estrategia de tagging recomendada', 'LOW', region)
+              else:
+                  add(fs, 'Tagging', 'FAIL', 'Nenhuma tag definida pelo usuario encontrada', 'LOW', region)
+
+              ssm = boto3.client('ssm', region_name=region)
+              docs, err = api(lambda: pages(ssm, 'list_documents', 'DocumentIdentifiers',
+                                            Filters=[{'Key': 'Owner', 'Values': ['Self']}]), [])
+              if err:
+                  unknown(fs, 'SSM Runbooks', err, 'LOW', region)
+              elif docs:
+                  add(fs, 'SSM Runbooks', 'OK', f'{len(docs)} documento(s) SSM proprios', 'LOW', region)
+              else:
+                  add(fs, 'SSM Runbooks', 'WARN', 'Nenhum runbook SSM proprio encontrado', 'LOW', region)
+              return fs
+
+          # ---------------- PILAR 2: SEGURANCA ----------------
+          def pillar2_global():
+              fs = []
+              iam = boto3.client('iam')
+              summary, err = api(lambda: iam.get_account_summary().get('SummaryMap', {}), {})
+              if err:
+                  unknown(fs, 'MFA Root', err, 'CRITICAL')
+                  unknown(fs, 'Chaves de acesso do root', err, 'CRITICAL')
+              else:
+                  if summary.get('AccountMFAEnabled', 0) == 1:
+                      add(fs, 'MFA Root', 'OK', 'MFA habilitado na conta root', 'CRITICAL')
+                  else:
+                      add(fs, 'MFA Root', 'FAIL', 'MFA NAO habilitado na conta root - risco critico', 'CRITICAL')
+                  if summary.get('AccountAccessKeysPresent', 0) == 0:
+                      add(fs, 'Chaves de acesso do root', 'OK', 'Conta root sem access keys', 'CRITICAL')
+                  else:
+                      add(fs, 'Chaves de acesso do root', 'FAIL', 'Conta root possui access keys - remova-as', 'CRITICAL')
+
+              if not err and summary.get('Users', 0) == 0:
+                  add(fs, 'Password Policy', 'INFO', 'Nenhum usuario IAM (acesso via federacao/SSO) - nao se aplica', 'MEDIUM')
+              else:
+                  pp, err = api(lambda: iam.get_account_password_policy().get('PasswordPolicy', {}), {}, expected=('NoSuchEntity',))
+                  if err:
+                      unknown(fs, 'Password Policy', err, 'MEDIUM')
+                  elif pp.get('MinimumPasswordLength', 0) >= 14 and pp.get('RequireSymbols', False):
+                      add(fs, 'Password Policy', 'OK', f'Politica forte: min {pp["MinimumPasswordLength"]} chars', 'MEDIUM')
+                  elif pp:
+                      add(fs, 'Password Policy', 'WARN', 'Politica existe mas pode ser mais restritiva', 'MEDIUM')
+                  else:
+                      add(fs, 'Password Policy', 'FAIL', 'Nenhuma politica de senha configurada', 'MEDIUM')
+
+              s3c = boto3.client('s3control', region_name=HOME_REGION)
+              bpa, err = api(lambda: s3c.get_public_access_block(AccountId=ACCOUNT_ID).get('PublicAccessBlockConfiguration', {}), {}, expected=('NoSuchPublicAccessBlockConfiguration',))
+              if err:
+                  unknown(fs, 'S3 Block Public Access', err, 'HIGH')
+              elif all(bpa.get(k) for k in ('BlockPublicAcls', 'BlockPublicPolicy', 'IgnorePublicAcls', 'RestrictPublicBuckets')):
+                  add(fs, 'S3 Block Public Access', 'OK', 'Block Public Access habilitado na conta', 'HIGH')
+              else:
+                  add(fs, 'S3 Block Public Access', 'FAIL', 'S3 Block Public Access nao totalmente habilitado na conta', 'HIGH')
+              return fs
+
+          def pillar2_regional(region):
+              fs = []
+              gd = boto3.client('guardduty', region_name=region)
+              dets, err = api(lambda: pages(gd, 'list_detectors', 'DetectorIds'), [])
+              if err:
+                  unknown(fs, 'GuardDuty', err, 'HIGH', region)
+              elif not dets:
+                  add(fs, 'GuardDuty', 'FAIL', 'GuardDuty nao habilitado', 'HIGH', region)
+              else:
+                  det, err = api(lambda: gd.get_detector(DetectorId=dets[0]), {})
+                  if err:
+                      unknown(fs, 'GuardDuty', err, 'HIGH', region)
+                  elif det.get('Status') == 'ENABLED':
+                      add(fs, 'GuardDuty', 'OK', 'GuardDuty habilitado e ativo', 'HIGH', region)
+                  else:
+                      add(fs, 'GuardDuty', 'WARN', 'GuardDuty existe mas nao esta ENABLED', 'HIGH', region)
+
+              sh = boto3.client('securityhub', region_name=region)
+              hub, err = api(lambda: sh.describe_hub(), {}, expected=('InvalidAccessException', 'ResourceNotFoundException'))
+              if err:
+                  unknown(fs, 'Security Hub', err, 'MEDIUM', region)
+              elif hub.get('HubArn'):
+                  add(fs, 'Security Hub', 'OK', 'Security Hub habilitado', 'MEDIUM', region)
+              else:
+                  add(fs, 'Security Hub', 'WARN', 'Security Hub nao habilitado', 'MEDIUM', region)
+
+              aa = boto3.client('accessanalyzer', region_name=region)
+              ans, err = api(lambda: pages(aa, 'list_analyzers', 'analyzers'), [])
+              if err:
+                  unknown(fs, 'IAM Access Analyzer', err, 'MEDIUM', region)
+              elif any(a.get('status') == 'ACTIVE' for a in ans):
+                  add(fs, 'IAM Access Analyzer', 'OK', f'{len(ans)} analyzer(s) configurado(s)', 'MEDIUM', region)
+              else:
+                  add(fs, 'IAM Access Analyzer', 'WARN', 'IAM Access Analyzer nao configurado ou inativo', 'MEDIUM', region)
+              return fs
+
+          # ---------------- PILAR 3: CONFIABILIDADE ----------------
+          def pillar3(region):
+              fs = []
+              rds = boto3.client('rds', region_name=region)
+              dbs, err = api(lambda: pages(rds, 'describe_db_instances', 'DBInstances'), [])
+              solo = [d for d in dbs if not d.get('DBClusterIdentifier')]
+              if err:
+                  unknown(fs, 'RDS Multi-AZ', err, 'HIGH', region)
+              elif not solo:
+                  add(fs, 'RDS Multi-AZ', 'INFO', 'Nenhuma instancia RDS standalone (instancias de cluster ficam fora deste check)', 'HIGH', region)
+              else:
+                  single = [d['DBInstanceIdentifier'] for d in solo if not d.get('MultiAZ')]
+                  st = 'OK' if not single else ('WARN' if len(single) < len(solo) else 'FAIL')
+                  add(fs, 'RDS Multi-AZ', st, f'{len(solo) - len(single)}/{len(solo)} instancias RDS em Multi-AZ', 'HIGH', region, single)
+
+              insts, err = running_instances(region)
+              if err:
+                  unknown(fs, 'Auto Scaling', err, 'MEDIUM', region)
+              elif not insts:
+                  add(fs, 'Auto Scaling', 'INFO', 'Nenhuma instancia EC2 em execucao', 'MEDIUM', region)
+              else:
+                  loose = [i['InstanceId'] for i in insts if not any(t['Key'] == 'aws:autoscaling:groupName' for t in i.get('Tags', []))]
+                  st = 'OK' if not loose else ('WARN' if len(loose) < len(insts) else 'FAIL')
+                  add(fs, 'Auto Scaling', st, f'{len(insts) - len(loose)}/{len(insts)} instancias EC2 gerenciadas por Auto Scaling Group', 'MEDIUM', region, loose)
+
+              bkp = boto3.client('backup', region_name=region)
+              plans, err = api(lambda: pages(bkp, 'list_backup_plans', 'BackupPlansList'), [])
+              if err:
+                  unknown(fs, 'AWS Backup', err, 'HIGH', region)
+              elif plans:
+                  add(fs, 'AWS Backup', 'OK', f'{len(plans)} plano(s) de backup configurado(s)', 'HIGH', region)
+              else:
+                  add(fs, 'AWS Backup', 'FAIL', 'Nenhum plano de backup AWS Backup encontrado', 'HIGH', region)
+
+              ec2 = boto3.client('ec2', region_name=region)
+              zones, err1 = api(lambda: [z['ZoneName'] for z in ec2.describe_availability_zones()['AvailabilityZones']
+                                         if z.get('ZoneType') == 'availability-zone'], [])
+              subs, err2 = api(lambda: pages(ec2, 'describe_subnets', 'Subnets'), [])
+              if err1 or err2:
+                  unknown(fs, 'Multi-AZ Subnets', err1 or err2, 'MEDIUM', region)
+              elif not subs:
+                  add(fs, 'Multi-AZ Subnets', 'INFO', 'Nenhuma subnet na regiao', 'MEDIUM', region)
+              else:
+                  azs = {s['AvailabilityZone'] for s in subs} & set(zones)
+                  need = min(3, len(zones))
+                  if len(azs) >= need:
+                      add(fs, 'Multi-AZ Subnets', 'OK', f'Subnets em {len(azs)} AZs diferentes', 'MEDIUM', region)
+                  elif len(azs) >= 2:
+                      add(fs, 'Multi-AZ Subnets', 'WARN', f'Subnets em apenas {len(azs)} de {len(zones)} AZs', 'MEDIUM', region)
+                  else:
+                      add(fs, 'Multi-AZ Subnets', 'FAIL', 'Subnets em apenas 1 AZ - sem redundancia', 'MEDIUM', region)
+              return fs
+
+          # ---------------- PILAR 4: EFICIENCIA DE PERFORMANCE ----------------
+          def pillar4(region):
+              fs = []
+              insts, err = running_instances(region)
+              info, err2 = instance_types(region)
+              if err or err2:
+                  unknown(fs, 'EC2 Geracao Atual', err or err2, 'MEDIUM', region)
+              elif not insts:
+                  add(fs, 'EC2 Geracao Atual', 'INFO', 'Nenhuma instancia EC2 em execucao', 'MEDIUM', region)
+              else:
+                  old = [i['InstanceId'] for i in insts if not info.get(i['InstanceType'], {}).get('current', True)]
+                  cur = len(insts) - len(old)
+                  add(fs, 'EC2 Geracao Atual', ratio_status(cur / len(insts), 0.8, 0.5),
+                      f'{cur}/{len(insts)} instancias em geracao atual (segundo a API do EC2)', 'MEDIUM', region, old)
+
+              funcs, err = lambda_functions(region)
+              if err:
+                  unknown(fs, 'Lambda Runtimes', err, 'HIGH', region)
+              elif not funcs:
+                  add(fs, 'Lambda Runtimes', 'INFO', 'Nenhuma outra funcao Lambda encontrada', 'HIGH', region)
+              else:
+                  old = [f['FunctionName'] for f in funcs if f.get('Runtime') in DEPRECATED_RUNTIMES]
+                  if old:
+                      add(fs, 'Lambda Runtimes', 'WARN', f'{len(old)}/{len(funcs)} funcao(oes) com runtime depreciado', 'HIGH', region, old)
+                  else:
+                      add(fs, 'Lambda Runtimes', 'OK', f'Todas as {len(funcs)} funcoes em runtime suportado', 'HIGH', region)
+
+              ec = boto3.client('elasticache', region_name=region)
+              clusters, err = api(lambda: pages(ec, 'describe_cache_clusters', 'CacheClusters'), [])
+              if err:
+                  unknown(fs, 'ElastiCache', err, 'LOW', region)
+              elif clusters:
+                  add(fs, 'ElastiCache', 'INFO', f'{len(clusters)} cluster(s) ElastiCache (inventario)', 'LOW', region)
+              else:
+                  add(fs, 'ElastiCache', 'INFO', 'Nenhum cluster ElastiCache - avalie caching se houver leitura intensiva', 'LOW', region)
+              return fs
+
+          def pillar4_global():
+              fs = []
+              cf = boto3.client('cloudfront')
+              n, err = api(lambda: sum(len(p.get('DistributionList', {}).get('Items') or [])
+                                       for p in cf.get_paginator('list_distributions').paginate()), 0)
+              if err:
+                  unknown(fs, 'CloudFront CDN', err, 'LOW')
+              elif n:
+                  add(fs, 'CloudFront CDN', 'INFO', f'{n} distribuicao(oes) CloudFront (inventario)', 'LOW')
+              else:
+                  add(fs, 'CloudFront CDN', 'INFO', 'Nenhuma distribuicao CloudFront - avalie CDN para conteudo estatico', 'LOW')
+              return fs
+
+          # ---------------- PILAR 5: OTIMIZACAO DE CUSTOS ----------------
+          STOP_RE = re.compile(r'\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) GMT\)')
+
+          def stopped_days(inst):
+              m = STOP_RE.search(inst.get('StateTransitionReason', ''))
+              if not m:
+                  return None
+              when = datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+              return (datetime.now(timezone.utc) - when).days
+
+          def pillar5(region):
+              fs = []
+              ec2 = boto3.client('ec2', region_name=region)
+              res, err = api(lambda: pages(ec2, 'describe_instances', 'Reservations',
+                                           Filters=[{'Name': 'instance-state-name', 'Values': ['stopped']}]), [])
+              if err:
+                  unknown(fs, 'Instancias Paradas', err, 'MEDIUM', region)
+              else:
+                  stopped = [i for r in res for i in r.get('Instances', [])]
+                  stale = [i['InstanceId'] for i in stopped if stopped_days(i) is None or stopped_days(i) > 7]
+                  if stale:
+                      add(fs, 'Instancias Paradas', 'WARN', f'{len(stale)} instancia(s) EC2 parada(s) ha mais de 7 dias (ou de idade desconhecida)', 'MEDIUM', region, stale)
+                  else:
+                      add(fs, 'Instancias Paradas', 'OK', 'Nenhuma instancia EC2 parada ha mais de 7 dias', 'MEDIUM', region)
+
+              vols, err = api(lambda: pages(ec2, 'describe_volumes', 'Volumes', Filters=[{'Name': 'status', 'Values': ['available']}]), [])
+              if err:
+                  unknown(fs, 'Volumes EBS Ociosos', err, 'MEDIUM', region)
+              elif vols:
+                  add(fs, 'Volumes EBS Ociosos', 'WARN', f'{len(vols)} volume(s) EBS nao anexado(s) - custo desnecessario', 'MEDIUM', region, [v['VolumeId'] for v in vols])
+              else:
+                  add(fs, 'Volumes EBS Ociosos', 'OK', 'Nenhum volume EBS nao anexado', 'MEDIUM', region)
+
+              eips, err = api(lambda: ec2.describe_addresses().get('Addresses', []), [])
+              unused = [e.get('PublicIp') for e in eips if not e.get('AssociationId')]
+              if err:
+                  unknown(fs, 'IPs Elasticos', err, 'MEDIUM', region)
+              elif unused:
+                  add(fs, 'IPs Elasticos', 'WARN', f'{len(unused)} IP(s) elastico(s) nao associado(s) - cobrados por hora', 'MEDIUM', region, unused)
+              else:
+                  add(fs, 'IPs Elasticos', 'OK', 'Todos os IPs elasticos estao em uso', 'MEDIUM', region)
+              return fs
+
+          def pillar5_global():
+              fs = []
+              in_use = any(v[0] for k, v in _cache.items() if k[0] in ('ec2', 'lambda'))
+              if not in_use:
+                  add(fs, 'Savings Plans', 'INFO', 'Sem EC2/Lambda em uso nas regioes avaliadas - nao se aplica', 'LOW')
+                  return fs
+              sp = boto3.client('savingsplans', region_name='us-east-1')
+              plans, err = api(lambda: sp.describe_savings_plans(states=['active']).get('savingsPlans', []), [])
+              if err:
+                  unknown(fs, 'Savings Plans', err, 'LOW')
+              elif plans:
+                  add(fs, 'Savings Plans', 'OK', f'{len(plans)} Savings Plan(s) ativo(s)', 'LOW')
+              else:
+                  add(fs, 'Savings Plans', 'WARN', 'Nenhum Savings Plan ativo - avalie conforme o perfil de uso (ou Reserved Instances)', 'LOW')
+              return fs
+
+          # ---------------- PILAR 6: SUSTENTABILIDADE ----------------
+          _bucket_loc = {}
+
+          def bucket_region(s3, name):
+              if name not in _bucket_loc:
+                  loc = s3.get_bucket_location(Bucket=name).get('LocationConstraint')
+                  _bucket_loc[name] = 'us-east-1' if not loc else ('eu-west-1' if loc == 'EU' else loc)
+              return _bucket_loc[name]
+
+          def pillar6(region):
+              fs = []
+              insts, err = running_instances(region)
+              info, err2 = instance_types(region)
+              if err or err2:
+                  unknown(fs, 'Graviton (ARM)', err or err2, 'LOW', region)
+              elif not insts:
+                  add(fs, 'Graviton (ARM)', 'INFO', 'Nenhuma instancia EC2 em execucao', 'LOW', region)
+              else:
+                  x86 = [i['InstanceId'] for i in insts if not info.get(i['InstanceType'], {}).get('arm', False)]
+                  arm = len(insts) - len(x86)
+                  st = 'OK' if arm / len(insts) >= 0.5 else 'WARN'
+                  add(fs, 'Graviton (ARM)', st, f'{arm}/{len(insts)} instancias EC2 arm64 (Graviton) - menor consumo energetico', 'LOW', region, x86 if st == 'WARN' else None)
+
+              funcs, err = lambda_functions(region)
+              if err:
+                  unknown(fs, 'Lambda arm64', err, 'LOW', region)
+              elif not funcs:
+                  add(fs, 'Lambda arm64', 'INFO', 'Nenhuma outra funcao Lambda encontrada', 'LOW', region)
+              else:
+                  x86 = [f['FunctionName'] for f in funcs if 'arm64' not in f.get('Architectures', [])]
+                  arm = len(funcs) - len(x86)
+                  st = 'OK' if arm / len(funcs) >= 0.5 else 'WARN'
+                  add(fs, 'Lambda arm64', st, f'{arm}/{len(funcs)} funcoes Lambda em arm64', 'LOW', region, x86 if st == 'WARN' else None)
+
+              s3 = boto3.client('s3', region_name=region)
+              names, err = api(lambda: [b['Name'] for b in s3.list_buckets().get('Buckets', []) if b['Name'] != REPORT_BUCKET], [])
+              if err:
+                  unknown(fs, 'S3 Lifecycle/Intelligent-Tiering', err, 'LOW', region)
+              else:
+                  covered, bare, failed = 0, [], 0
+                  for name in names[:100]:
+                      loc, e = api(lambda: bucket_region(s3, name), None)
+                      if e or loc != region:
+                          continue
+                      lc, e1 = api(lambda: s3.get_bucket_lifecycle_configuration(Bucket=name).get('Rules', []), [],
+                                   expected=('NoSuchLifecycleConfiguration',))
+                      it, e2 = api(lambda: s3.list_bucket_intelligent_tiering_configurations(Bucket=name)
+                                   .get('IntelligentTieringConfigurationList', []), [])
+                      if e1 or e2:
+                          failed += 1
+                      elif lc or it:
+                          covered += 1
+                      else:
+                          bare.append(name)
+                  total = covered + len(bare)
+                  if failed and not total:
+                      unknown(fs, 'S3 Lifecycle/Intelligent-Tiering', 'falha nas chamadas por bucket', 'LOW', region)
+                  elif not total:
+                      add(fs, 'S3 Lifecycle/Intelligent-Tiering', 'INFO', 'Nenhum outro bucket na regiao', 'LOW', region)
+                  else:
+                      add(fs, 'S3 Lifecycle/Intelligent-Tiering', ratio_status(covered / total, 0.5, 0.01),
+                          f'{covered}/{total} buckets com lifecycle ou Intelligent-Tiering' + (f' ({failed} nao verificados)' if failed else '')
+                          + (f' (limite: apenas os 100 primeiros de {len(names)} buckets da conta foram avaliados)' if len(names) > 100 else ''),
+                          'LOW', region, bare)
+
+              if region in LOW_CARBON_REGIONS:
+                  add(fs, 'Regiao de baixo carbono', 'OK', f'{region} esta na lista de regioes de baixo carbono', 'LOW', region)
+              else:
+                  add(fs, 'Regiao de baixo carbono', 'INFO', f'{region} nao esta na lista - considere regioes de menor intensidade de carbono para novos workloads (respeitando latencia e residencia de dados)', 'LOW', region)
+              return fs
+
+          # ---------------- ORQUESTRACAO ----------------
+          def guarded(label, fn, *args):
+              try:
+                  return fn(*args)
+              except Exception as e:
+                  print(f'ERROR {label}: {type(e).__name__}: {e}')
+                  return [{'check': label, 'status': 'UNKNOWN', 'severity': 'MEDIUM',
+                           'region': args[0] if args else 'global',
+                           'detail': f'Erro interno ao executar o check ({type(e).__name__})'}]
+
+          def summarize(fs):
+              earned = total = 0
+              for f in fs:
+                  if f['status'] in ('INFO', 'UNKNOWN'):
+                      continue
+                  w = WEIGHTS[f['severity']]
+                  total += w
+                  earned += w if f['status'] == 'OK' else (w / 2 if f['status'] == 'WARN' else 0)
+              return {'score': round(earned / total * 100) if total else None,
+                      'applicable_checks': sum(1 for f in fs if f['status'] not in ('INFO', 'UNKNOWN')),
+                      'unverified_checks': sum(1 for f in fs if f['status'] == 'UNKNOWN'),
+                      'findings': fs}
+
+          def run_assessment():
+              now = datetime.now(timezone.utc)
+              day, stamp = now.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%dT%H%M%SZ')
+              print(f'Starting WAF Assessment for account {ACCOUNT_ID} in regions {REGIONS}')
+
+              fs = {p: [] for p in PILLARS}
+              for region in REGIONS:
+                  fs['operational_excellence'] += guarded('Pilar 1', pillar1, region)
+                  fs['security'] += guarded('Pilar 2 (regional)', pillar2_regional, region)
+                  fs['reliability'] += guarded('Pilar 3', pillar3, region)
+                  fs['performance_efficiency'] += guarded('Pilar 4', pillar4, region)
+                  fs['cost_optimization'] += guarded('Pilar 5', pillar5, region)
+                  fs['sustainability'] += guarded('Pilar 6', pillar6, region)
+
+              fs['security'] += guarded('Pilar 2 (global)', pillar2_global)
+              fs['performance_efficiency'] += guarded('Pilar 4 (global)', pillar4_global)
+              fs['cost_optimization'] += guarded('Pilar 5 (global)', pillar5_global)
+
+              pillars = {p: summarize(v) for p, v in fs.items()}
+              scores = [v['score'] for v in pillars.values() if v['score'] is not None]
+              overall = round(sum(scores) / len(scores)) if scores else None
+              critical = [f"{PILLAR_NAMES[p]}: {f['check']} ({f['region']})"
+                          for p, v in fs.items() for f in v if f['status'] == 'FAIL' and f['severity'] == 'CRITICAL']
+              capped = bool(critical) and overall is not None and overall > CRITICAL_CAP
+              if capped:
+                  overall = CRITICAL_CAP
+              unverified = sum(v['unverified_checks'] for v in pillars.values())
+
+              report = {'assessment_date': day, 'account_id': ACCOUNT_ID, 'regions': REGIONS,
+                        'overall_score': overall, 'score_capped_by_critical_failure': capped,
+                        'critical_failures': critical, 'unverified_checks': unverified, 'pillars': pillars}
+
+              key = f'assessments/{day}/waf-assessment-{ACCOUNT_ID}-{stamp}.json'
+              boto3.client('s3').put_object(Bucket=REPORT_BUCKET, Key=key, Body=json.dumps(report, indent=2, default=str),
+                                            ContentType='application/json', ServerSideEncryption='AES256')
+              print(f'Report saved: s3://{REPORT_BUCKET}/{key}')
+
+              if SNS_TOPIC:
+                  shown = 'n/a' if overall is None else f'{overall}/100'
+                  lines = [f'Well-Architected Assessment - {ACCOUNT_ID}', f'Data: {day}', f'Regioes: {", ".join(REGIONS)}',
+                           f'Score Geral: {shown}' + (f' (limitado a {CRITICAL_CAP} por falha critica)' if capped else ''), '']
+                  for p in PILLARS:
+                      s = pillars[p]['score']
+                      lines.append(f'  {PILLAR_NAMES[p]}: {"n/a" if s is None else str(s) + "/100"}')
+                  if critical:
+                      lines += ['', 'FALHAS CRITICAS:'] + [f'  - {c}' for c in critical]
+                  if unverified:
+                      lines += ['', f'{unverified} check(s) nao puderam ser verificados (ver UNKNOWN no relatorio)']
+                  lines += ['', f'Relatorio: s3://{REPORT_BUCKET}/{key}']
+                  _, err = api(lambda: boto3.client('sns', region_name=SNS_TOPIC.split(':')[3]).publish(
+                      TopicArn=SNS_TOPIC, Subject=f'WAF Assessment {ACCOUNT_ID} - Score {shown}', Message='\n'.join(lines)))
+                  if err:
+                      print(f'WARN: falha ao publicar no SNS ({err})')
+
+              return {'statusCode': 200, 'overall_score': overall, 'report_s3_key': key}
+
+          def handler(event, context):
+              return run_assessment()
+
+  # -------------------------------------------------------------------------
+  # Sem retentativas automaticas: uma falha nao dispara o assessment 3 vezes
+  # -------------------------------------------------------------------------
+  FunctionEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref WafAssessmentFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+  # -------------------------------------------------------------------------
+  # EventBridge - Execucao mensal automatica
+  # -------------------------------------------------------------------------
+  MonthlyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Executa o WAF Assessment no primeiro dia de cada mes (09:00 UTC)
+      ScheduleExpression: 'cron(0 9 1 * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: WafAssessmentTarget
+          Arn: !GetAtt WafAssessmentFunction.Arn
+
+  LambdaPermissionEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WafAssessmentFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyRule.Arn
+
+  # -------------------------------------------------------------------------
+  # Trigger do deploy: funcao SEPARADA e minima (stdlib + boto3)
+  # Ela so dispara o assessment (assincrono) e responde ao CloudFormation,
+  # entao nada do assessment consegue impedir a resposta do Custom Resource.
+  # -------------------------------------------------------------------------
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldRunOnDeploy
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-trigger-${AWS::AccountId}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldRunOnDeploy
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: InvokeAssessment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt WafAssessmentFunction.Arn
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldRunOnDeploy
+    DependsOn: TriggerLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-trigger-${AWS::AccountId}'
+      Description: Dispara o WAF Assessment apos o deploy e responde ao CloudFormation
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: index.handler
+      Role: !GetAtt TriggerRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          TARGET_FUNCTION: !Ref WafAssessmentFunction
+      Tags:
+        - Key: Project
+          Value: waf-assessment
+        - Key: ManagedBy
+          Value: cloudformation
+      Code:
+        ZipFile: |
+          import json, os, http.client, boto3, traceback
+          from urllib.parse import urlparse
+
+          def respond(event, context, status, reason=''):
+              try:
+                  body = json.dumps({
+                      'Status': status,
+                      'Reason': reason or f'Logs: {context.log_group_name} / {context.log_stream_name}',
+                      'PhysicalResourceId': event.get('PhysicalResourceId', 'WafAssessmentTrigger'),
+                      'StackId': event['StackId'],
+                      'RequestId': event['RequestId'],
+                      'LogicalResourceId': event['LogicalResourceId'],
+                  }).encode('utf-8')
+
+                  u = urlparse(event['ResponseURL'])
+                  conn_cls = http.client.HTTPSConnection if u.scheme == 'https' else http.client.HTTPConnection
+                  conn = conn_cls(u.netloc, timeout=5)
+                  try:
+                      conn.request('PUT', u.path + ('?' + u.query if u.query else ''), body,
+                                   {'Content-Type': '', 'Content-Length': str(len(body))})
+                      http_status = conn.getresponse().status
+                      print(f'Resposta enviada ao CloudFormation: HTTP {http_status}')
+                  finally:
+                      conn.close()
+              except Exception as e:
+                  print(f'Erro ao responder ao CloudFormation: {type(e).__name__}: {e}')
+                  traceback.print_exc()
+                  raise
+
+          def handler(event, context):
+              print(f'RequestType={event.get("RequestType")} RequestId={event.get("RequestId")}')
+              status = 'SUCCESS'
+              reason = ''
+              try:
+                  if event['RequestType'] == 'Create':
+                      target = os.environ.get('TARGET_FUNCTION')
+                      r = boto3.client('lambda').invoke(
+                          FunctionName=target,
+                          InvocationType='Event',
+                          Payload=b'{}'
+                      )
+                      print(f'Assessment disparado: HTTP {r["StatusCode"]}')
+                  elif event['RequestType'] == 'Delete':
+                      print('Delete do custom resource - ignorando')
+              except Exception as e:
+                  print(f'WARN: nao foi possivel disparar o assessment: {type(e).__name__}: {e}')
+                  traceback.print_exc()
+                  status = 'FAILED'
+                  reason = f'{type(e).__name__}: {str(e)[:200]}'
+              finally:
+                  respond(event, context, status, reason)
+
+  TriggerOnDeploy:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: ShouldRunOnDeploy
+    DependsOn:
+      - FunctionEventInvokeConfig
+      - LambdaPermissionEventBridge
+    Properties:
+      ServiceToken: !GetAtt TriggerFunction.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Value: !Ref WafAssessmentFunction
+  ReportBucket:
+    Value: !Ref ReportBucket
+  ReportPath:
+    Value: !Sub 's3://${ReportBucket}/assessments/'
+  RunManually:
+    Description: Dispara o assessment de forma assincrona (o relatorio aparece no S3 em alguns minutos)
+    Value: !Sub 'aws lambda invoke --function-name ${WafAssessmentFunction} --region ${AWS::Region} --invocation-type Event --cli-binary-format raw-in-base64-out --payload ''{}'' output.json'
+  EmailNote:
+    Condition: HasEmail
+    Description: Atencao
+    Value: >-
+      Confirme a assinatura SNS enviada por email. O assessment do deploy roda antes da confirmacao,
+      entao o primeiro resumo nao chega - dispare manualmente (RunManually) depois de confirmar.
