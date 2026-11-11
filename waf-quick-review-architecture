@@ -989,4 +989,4 @@ Outputs:
     Description: Atencao
     Value: >-
       Confirme a assinatura SNS enviada por email. O assessment do deploy roda antes da confirmacao,
-      entao o primeiro resumo nao chega - dispare manualmente (RunManually) depois de confirmar.
+      entao o primeiro resumo nao chega - dispare manualmente (RunManually) depois de confirmar.
