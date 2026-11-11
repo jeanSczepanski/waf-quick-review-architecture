@@ -1,0 +1,81 @@
+{
+  "assessment_date": "2026-10-06",
+  "account_id": "<redacted-account-id>",
+  "regions": ["us-east-2"],
+  "overall_score": 50,
+  "score_capped_by_critical_failure": true,
+  "critical_failures": ["Security: Root MFA (global)"],
+  "unverified_checks": 0,
+  "pillars": {
+    "operational_excellence": {
+      "score": 40,
+      "applicable_checks": 5,
+      "unverified_checks": 0,
+      "findings": [
+        {"check": "CloudTrail", "status": "FAIL", "severity": "HIGH", "region": "us-east-2", "detail": "No active trail found"},
+        {"check": "AWS Config", "status": "OK", "severity": "MEDIUM", "region": "us-east-2", "detail": "Config recorder is active"},
+        {"check": "CloudWatch Alarms", "status": "FAIL", "severity": "MEDIUM", "region": "us-east-2", "detail": "No CloudWatch alarms configured"},
+        {"check": "Tagging", "status": "OK", "severity": "LOW", "region": "us-east-2", "detail": "User-defined tag keys exist; resource coverage was not verified"},
+        {"check": "SSM Runbooks", "status": "OK", "severity": "LOW", "region": "us-east-2", "detail": "One customer-owned SSM document found"}
+      ]
+    },
+    "security": {
+      "score": 54,
+      "applicable_checks": 7,
+      "unverified_checks": 0,
+      "findings": [
+        {"check": "GuardDuty", "status": "OK", "severity": "HIGH", "region": "us-east-2", "detail": "GuardDuty is enabled and active"},
+        {"check": "Security Hub", "status": "OK", "severity": "MEDIUM", "region": "us-east-2", "detail": "Security Hub is enabled"},
+        {"check": "IAM Access Analyzer", "status": "OK", "severity": "MEDIUM", "region": "us-east-2", "detail": "Two analyzers configured"},
+        {"check": "Root MFA", "status": "FAIL", "severity": "CRITICAL", "region": "global", "detail": "Root account MFA is not enabled"},
+        {"check": "Root access keys", "status": "OK", "severity": "CRITICAL", "region": "global", "detail": "Root account has no access keys"},
+        {"check": "Password Policy", "status": "FAIL", "severity": "MEDIUM", "region": "global", "detail": "No account password policy configured"},
+        {"check": "S3 Block Public Access", "status": "FAIL", "severity": "HIGH", "region": "global", "detail": "Account-level S3 Block Public Access is not fully enabled"}
+      ]
+    },
+    "reliability": {
+      "score": 17,
+      "applicable_checks": 2,
+      "unverified_checks": 0,
+      "findings": [
+        {"check": "RDS Multi-AZ", "status": "INFO", "severity": "HIGH", "region": "us-east-2", "detail": "No standalone RDS instances found; cluster instances are outside this check"},
+        {"check": "Auto Scaling", "status": "INFO", "severity": "MEDIUM", "region": "us-east-2", "detail": "No running EC2 instances found"},
+        {"check": "AWS Backup", "status": "FAIL", "severity": "HIGH", "region": "us-east-2", "detail": "No AWS Backup plans found"},
+        {"check": "Multi-AZ Subnets", "status": "WARN", "severity": "MEDIUM", "region": "us-east-2", "detail": "Subnets span two of three Availability Zones"}
+      ]
+    },
+    "performance_efficiency": {
+      "score": 100,
+      "applicable_checks": 1,
+      "unverified_checks": 0,
+      "findings": [
+        {"check": "EC2 Current Generation", "status": "INFO", "severity": "MEDIUM", "region": "us-east-2", "detail": "No running EC2 instances found"},
+        {"check": "Lambda Runtimes", "status": "OK", "severity": "HIGH", "region": "us-east-2", "detail": "All eight functions use runtimes not listed as deprecated in the configured list"},
+        {"check": "ElastiCache", "status": "INFO", "severity": "LOW", "region": "us-east-2", "detail": "No ElastiCache clusters found"},
+        {"check": "CloudFront CDN", "status": "INFO", "severity": "LOW", "region": "global", "detail": "No CloudFront distributions found"}
+      ]
+    },
+    "cost_optimization": {
+      "score": 79,
+      "applicable_checks": 4,
+      "unverified_checks": 0,
+      "findings": [
+        {"check": "Stopped Instances", "status": "OK", "severity": "MEDIUM", "region": "us-east-2", "detail": "No EC2 instances stopped for more than seven days"},
+        {"check": "Unattached EBS Volumes", "status": "OK", "severity": "MEDIUM", "region": "us-east-2", "detail": "No unattached EBS volumes found"},
+        {"check": "Elastic IPs", "status": "WARN", "severity": "MEDIUM", "region": "us-east-2", "detail": "Two unassociated Elastic IPs found; values redacted", "resources": ["<redacted-public-ip>", "<redacted-public-ip>"]},
+        {"check": "Savings Plans", "status": "WARN", "severity": "LOW", "region": "global", "detail": "No active Savings Plans found"}
+      ]
+    },
+    "sustainability": {
+      "score": 50,
+      "applicable_checks": 2,
+      "unverified_checks": 0,
+      "findings": [
+        {"check": "Graviton (ARM)", "status": "INFO", "severity": "LOW", "region": "us-east-2", "detail": "No running EC2 instances found"},
+        {"check": "Lambda arm64", "status": "WARN", "severity": "LOW", "region": "us-east-2", "detail": "One of eight functions uses arm64; function names redacted", "resources": ["<redacted-function-name>"]},
+        {"check": "S3 Lifecycle/Intelligent-Tiering", "status": "WARN", "severity": "LOW", "region": "us-east-2", "detail": "One of thirteen buckets has lifecycle or Intelligent-Tiering configuration; bucket names redacted", "resources": ["<redacted-bucket-name>"]},
+        {"check": "Low-carbon region", "status": "INFO", "severity": "LOW", "region": "us-east-2", "detail": "This region is not in the configurable low-carbon region list"}
+      ]
+    }
+  }
+}
